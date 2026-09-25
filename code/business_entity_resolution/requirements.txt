@@ -1,0 +1,17 @@
+# Pinned environment for the Business Entity Resolution pipeline.
+# Python 3.10 - 3.12.  All libraries below are MIT / BSD / Apache-2.0.
+pandas==2.2.3
+numpy==1.26.4
+scipy==1.13.1
+scikit-learn==1.5.2
+lightgbm==4.5.0
+rapidfuzz==3.10.1
+sparse_dot_topn==1.1.5
+pyarrow==17.0.0
+tqdm==4.66.5
+
+# Optional dense-retrieval stage (enable with AML_USE_EMB=1).
+# intfloat/multilingual-e5-small is MIT licensed, 118M parameters,
+# comfortably inside the 8B limit.
+# sentence-transformers==3.2.1
+# torch==2.4.1

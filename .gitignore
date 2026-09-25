@@ -1,0 +1,53 @@
+# Large dataset files (too big for GitHub)
+*.zip
+*.tar.gz
+*.tar.bz2
+
+# Dataset TSV files (large raw data)
+student_resource/dataset/train/*.tsv
+student_resource/dataset/test/*.tsv
+
+# macOS system files
+.DS_Store
+__MACOSX/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+.venv/
+venv/
+env/
+.env
+
+# Jupyter Notebooks checkpoints
+.ipynb_checkpoints/
+
+# Model binaries / large model files
+*.bin
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
+*.pkl
+*.pickle
+work/models/
+
+# Output files (can be regenerated)
+output/
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
+logs/
