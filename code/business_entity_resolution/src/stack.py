@@ -30,7 +30,7 @@ import pandas as pd
 from rapidfuzz import fuzz
 from rapidfuzz import process as rf_process
 
-from . import config
+from . import config, gbm
 from .pairfeat import build_features
 from .run_model import ATTR_COLS, enc_ids, load_left, load_right, read_ground_truth
 
@@ -161,21 +161,21 @@ def main(argv=None):
     folds = fold_of(sids, a.folds)
     cols = list(feats.columns)
     oof = np.zeros(len(pairs), np.float32)
+    print(f"[stack] backend={gbm.BACKEND} gpu={gbm.USE_GPU}", flush=True)
     for k in range(a.folds):
         tr = folds != k
-        d = lgb.Dataset(feats[tr], label=y[tr], feature_name=cols)
-        b = lgb.train(config.LGB_PARAMS, d, num_boost_round=900)
-        oof[~tr] = b.predict(feats[~tr]).astype(np.float32)
+        b = gbm.train(config.LGB_PARAMS, feats[tr], y[tr], rounds=900,
+                      feature_names=cols, log_every=300)
+        oof[~tr] = gbm.predict(b, feats[~tr], cols)
         print(f"[stack] fold {k + 1}/{a.folds} done [{time.time() - t0:.0f}s]",
               flush=True)
-        del d, b
+        del b
 
     # full stage-1 model, for use at test time
-    d = lgb.Dataset(feats, label=y, feature_name=cols)
-    full = lgb.train(config.LGB_PARAMS, d, num_boost_round=900)
-    full.save_model(str(config.MODEL_DIR / "lgb_stage1.txt"))
+    full = gbm.train(config.LGB_PARAMS, feats, y, rounds=900,
+                     feature_names=cols, log_every=300)
+    gbm.save(full, config.MODEL_DIR / f"stage1.{gbm.model_suffix()}")
     json.dump(cols, open(config.MODEL_DIR / "features_stage1.json", "w"))
-    del d
     print(f"[stack] stage-1 full model saved [{time.time() - t0:.0f}s]",
           flush=True)
 
@@ -193,27 +193,19 @@ def main(argv=None):
     is_val = np.fromiter((s in val_ents for s in sids), bool, len(sids))
 
     cols2 = list(feats2.columns)
-    dtr = lgb.Dataset(feats2[~is_val], label=y[~is_val], feature_name=cols2)
-    dva = lgb.Dataset(feats2[is_val], label=y[is_val], feature_name=cols2,
-                      reference=dtr)
-    booster = lgb.train(config.LGB_PARAMS, dtr,
-                        num_boost_round=config.LGB_ROUNDS, valid_sets=[dva],
-                        callbacks=[lgb.early_stopping(config.LGB_EARLY_STOP,
-                                                      verbose=False),
-                                   lgb.log_evaluation(200)])
-    booster.save_model(str(config.MODEL_DIR / "lgb.txt"))
+    booster = gbm.train(config.LGB_PARAMS, feats2[~is_val], y[~is_val],
+                        feats2[is_val], y[is_val], rounds=config.LGB_ROUNDS,
+                        early_stop=config.LGB_EARLY_STOP, feature_names=cols2)
+    gbm.save(booster, config.MODEL_DIR / f"model.{gbm.model_suffix()}")
     json.dump(cols2, open(config.MODEL_DIR / "features.json", "w"))
-    print(f"[stack] stage-2 best_iter={booster.best_iteration}", flush=True)
-    imp = sorted(zip(cols2, booster.feature_importance("gain")),
-                 key=lambda x: -x[1])[:12]
+    print(f"[stack] stage-2 best_iter={gbm.best_iteration(booster)}", flush=True)
+    imp = gbm.importance(booster, cols2, top=12)
     for nm, g in imp:
         print(f"    {nm:22s} {g:12.0f}")
 
     val = pd.DataFrame({
         "source1_entity_id": sids[is_val], "cand_entity_id": cids[is_val],
-        "prob": booster.predict(feats2[is_val],
-                                num_iteration=booster.best_iteration
-                                ).astype(np.float32)})
+        "prob": gbm.predict(booster, feats2[is_val], cols2)})
     val.to_parquet(config.WORK_DIR / "val_probs.parquet", index=False)
     import pickle
     tm = {s: truth_enc[s] for s in val_ents if s in truth_enc}

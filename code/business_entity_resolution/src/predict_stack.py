@@ -24,7 +24,7 @@ import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
 
-from . import config
+from . import config, gbm
 from .pairfeat import build_features
 from .run_model import CHUNK_PAIRS, dec_ids, load_left, load_right
 from .stack import SIB_COLS, sibling_features
@@ -38,9 +38,9 @@ def main(argv=None):
     a = ap.parse_args(argv)
     t0 = time.time()
 
-    s1 = lgb.Booster(model_file=str(config.MODEL_DIR / "lgb_stage1.txt"))
+    s1 = gbm.load(config.MODEL_DIR / f"stage1.{gbm.model_suffix()}")
     cols1 = json.load(open(config.MODEL_DIR / "features_stage1.json"))
-    s2 = lgb.Booster(model_file=str(config.MODEL_DIR / "lgb.txt"))
+    s2 = gbm.load(config.MODEL_DIR / f"model.{gbm.model_suffix()}")
     cols2 = json.load(open(config.MODEL_DIR / "features.json"))
     hyb = json.load(open(config.MODEL_DIR / "hybrid.json"))
     print(f"[stack-predict] hybrid {hyb}", flush=True)
@@ -55,7 +55,7 @@ def main(argv=None):
     for batch in pf.iter_batches(batch_size=CHUNK_PAIRS):
         pairs = batch.to_pandas()
         f = build_features(pairs, left, right, verbose=False, split="test")
-        p1_parts.append(s1.predict(f[cols1]).astype(np.float32))
+        p1_parts.append(gbm.predict(s1, f[cols1], cols1))
         done += len(pairs)
         print(f"[stack-predict] pass1 {done:,} [{time.time() - t0:.0f}s]",
               flush=True)
@@ -88,7 +88,7 @@ def main(argv=None):
         f = build_features(pairs, left, right, verbose=False, split="test")
         blk = sib.iloc[off:off + n].reset_index(drop=True)
         f = pd.concat([f.reset_index(drop=True), blk], axis=1)
-        prob = s2.predict(f[cols2]).astype(np.float32)
+        prob = gbm.predict(s2, f[cols2], cols2)
         codes = np.fromiter((code_of[s] for s in pairs["source1_entity_id"]),
                             np.int32, n)
         cids = pairs["cand_id"].to_numpy()
