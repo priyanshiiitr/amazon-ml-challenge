@@ -73,6 +73,9 @@ def build_features(pairs: pd.DataFrame, left: pd.DataFrame, right: pd.DataFrame,
     for c in ("cand_n_claims", "cand_max_sim", "sim_rel_cand", "cand_is_best",
               "cand_rank", "cand_name_sim", "cand_name_max", "cand_name_rel",
               "cand_name_is_best", "cand_name_rank",
+              # embedding cosine from a pretrained multilingual encoder;
+              # information the string-similarity features cannot express
+              "emb_cos",
               # retrieval provenance: rev_rank==0 means this entity is the
               # record's single best owner among all 2.2M Source 1 entities
               "rev_score", "rev_rank", "fwd_hit", "rev_hit", "both_hit"):
