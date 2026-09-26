@@ -19,12 +19,13 @@ import pandas as pd
 import pyarrow.parquet as pq
 
 from . import config
+from . import gbm
 from .decision import apply_decision, tune_decision
 from .evaluate import detailed_report, print_report
 from .pairfeat import build_features
 
 ATTR_COLS = ["entity_id", "n_name", "s_name", "n_addr", "postal", "name_acr"]
-MODEL_PATH = config.MODEL_DIR / "lgb.txt"
+MODEL_PATH = config.MODEL_DIR / f"model.{gbm.model_suffix()}"
 KNOBS_PATH = config.MODEL_DIR / "decision.json"
 FEATS_PATH = config.MODEL_DIR / "features.json"
 CHUNK_PAIRS = 4_000_000
@@ -118,21 +119,17 @@ def cmd_train(a):
           f"val pairs {int(is_val.sum()):,}", flush=True)
 
     cols = list(feats.columns)
-    dtr = lgb.Dataset(feats[~is_val], label=y[~is_val], feature_name=cols)
-    dva = lgb.Dataset(feats[is_val], label=y[is_val], feature_name=cols,
-                      reference=dtr)
-    booster = lgb.train(config.LGB_PARAMS, dtr, num_boost_round=config.LGB_ROUNDS,
-                        valid_sets=[dva],
-                        callbacks=[lgb.early_stopping(config.LGB_EARLY_STOP,
-                                                      verbose=False),
-                                   lgb.log_evaluation(100)])
-    booster.save_model(str(MODEL_PATH))
+    print(f"[train] backend={gbm.BACKEND} gpu={gbm.USE_GPU}", flush=True)
+    booster = gbm.train(config.LGB_PARAMS, feats[~is_val], y[~is_val],
+                        feats[is_val], y[is_val],
+                        rounds=config.LGB_ROUNDS,
+                        early_stop=config.LGB_EARLY_STOP, feature_names=cols)
+    gbm.save(booster, MODEL_PATH)
     json.dump(cols, open(FEATS_PATH, "w"))
-    print(f"[train] best_iter={booster.best_iteration} "
+    print(f"[train] best_iter={gbm.best_iteration(booster)} "
           f"[{time.time() - t0:.0f}s]", flush=True)
 
-    imp = sorted(zip(cols, booster.feature_importance("gain")),
-                 key=lambda x: -x[1])[:15]
+    imp = gbm.importance(booster, cols, top=15)
     print("[train] top features by gain:")
     for nm, g in imp:
         print(f"    {nm:22s} {g:12.0f}")
@@ -141,8 +138,7 @@ def cmd_train(a):
     val = pd.DataFrame({
         "source1_entity_id": sids[is_val],
         "cand_entity_id": cids[is_val],
-        "prob": booster.predict(feats[is_val],
-                                num_iteration=booster.best_iteration),
+        "prob": gbm.predict(booster, feats[is_val], cols),
     })
     true_map = {sid: truth_enc[sid] for sid in val_ents if sid in truth_enc}
     true_map = {k: set(v.tolist()) for k, v in true_map.items()}
@@ -162,8 +158,9 @@ def cmd_predict(a):
     import lightgbm as lgb
 
     t0 = time.time()
-    booster = lgb.Booster(model_file=str(MODEL_PATH))
+    booster = gbm.load(MODEL_PATH)
     cols = json.load(open(FEATS_PATH))
+    print(f"[predict] backend={gbm.BACKEND} gpu={gbm.USE_GPU}", flush=True)
     knobs = json.load(open(KNOBS_PATH))["global"]
     print(f"[predict] knobs {knobs}", flush=True)
 
@@ -190,9 +187,7 @@ def cmd_predict(a):
     for batch in pf.iter_batches(batch_size=CHUNK_PAIRS):
         pairs = batch.to_pandas()
         feats = build_features(pairs, left, right, verbose=False, split="test")
-        prob = booster.predict(feats[cols],
-                               num_iteration=booster.best_iteration
-                               ).astype(np.float32)
+        prob = gbm.predict(booster, feats[cols], cols)
         codes = np.fromiter((code_of[s] for s in pairs["source1_entity_id"]),
                             np.int32, len(pairs))
         cids = pairs["cand_id"].to_numpy()
