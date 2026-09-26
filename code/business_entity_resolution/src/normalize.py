@@ -185,6 +185,16 @@ def skel(s: str) -> str:
     return " ".join(t for t in out if t)
 
 
+def _denum(t: str) -> str:
+    """'011' -> '11', '04th' -> '4th'. Error analysis found true pairs whose
+    addresses differed only by a leading zero ('b 011 c 2' vs 'b 11 c 2')
+    scoring as low as 0.06."""
+    if t[0].isdigit() and len(t) > 1:
+        stripped = t.lstrip("0")
+        return stripped if stripped and stripped[0].isdigit() else t
+    return t
+
+
 def norm_addr(s) -> str:
     """Cleaned address with abbreviations and US states expanded."""
     base = basic_clean(s)
@@ -199,7 +209,7 @@ def norm_addr(s) -> str:
         elif t in ADDR_STOPWORDS:
             continue
         else:
-            out.append(t)
+            out.append(_denum(t))
     return " ".join(out)
 
 

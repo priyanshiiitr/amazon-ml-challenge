@@ -20,7 +20,8 @@ import pandas as pd
 import pyarrow.parquet as pq
 
 from . import config
-from .retrieve import ShardIndex, extract_keys, query_shard, topk_per_row
+from .retrieve import (ShardIndex, extract_keys, query_shard, rescore_pairs,
+                       topk_per_row)
 
 COLS = ["entity_id", "country_key", "n_name", "s_name", "n_addr", "postal"]
 
@@ -53,11 +54,15 @@ def iter_shards(paths, country, batch_rows):
 
 
 def _first_shard_norm(paths, country, batch_rows, lrows, lhash, n_left):
-    """L2 norm of each left row in IDF space, from the first non-empty shard.
+    """Per-channel L2 norms of each left row in IDF space.
+
+    Returns a 2 x n_left array: row 0 over name-derived keys, row 1 over
+    address-derived keys, matching the channel split in query_shard.
 
     IDF is log(1 + N/df) and both N and df scale with shard size, so a single
     shard is an unbiased estimate of the global weight; what matters is that
-    every shard then uses the *same* one.
+    every shard then uses the *same* one, or scores would not be comparable
+    across the shards we merge.
     """
     for shard in iter_shards(paths, country, batch_rows):
         idx = ShardIndex(shard, verbose=False)
@@ -66,17 +71,22 @@ def _first_shard_norm(paths, country, batch_rows, lrows, lhash, n_left):
         pos = np.searchsorted(idx.uniq, lhash)
         np.clip(pos, 0, len(idx.uniq) - 1, out=pos)
         ok = idx.uniq[pos] == lhash
-        w = np.zeros(len(lhash), dtype=np.float64)
-        w[ok] = idx.idf[pos[ok]]
-        norm = np.sqrt(np.bincount(lrows, weights=w,
-                                   minlength=n_left)).astype(np.float32)
-        np.maximum(norm, 1e-6, out=norm)
-        return norm
-    return np.ones(n_left, np.float32)
+        w2 = np.zeros(len(lhash), dtype=np.float64)
+        w2[ok] = idx.idf[pos[ok]] ** 2
+        ch = np.full(len(lhash), -1, dtype=np.int8)
+        ch[ok] = idx.chan[pos[ok]]
+        out = np.empty((2, n_left), np.float32)
+        for c in (0, 1):
+            nrm = np.sqrt(np.bincount(lrows, weights=w2 * (ch == c),
+                                      minlength=n_left)).astype(np.float32)
+            np.maximum(nrm, 1e-6, out=nrm)
+            out[c] = nrm
+        return out
+    return np.ones((2, n_left), np.float32)
 
 
 def _block_country_parallel(left, paths, country, k, batch_rows,
-                            lrows, lhash, verbose, workers):
+                            lrows, lhash, verbose, workers, wide=0):
     import multiprocessing as mp
 
     t0 = time.time()
@@ -87,8 +97,11 @@ def _block_country_parallel(left, paths, country, k, batch_rows,
     best_s = np.empty(0, np.float32)
     ctx = mp.get_context("fork")
     done = 0
+    l_skel = left["s_name"].fillna("").to_numpy()
+    l_addr = left["n_addr"].fillna("").to_numpy()
     with ctx.Pool(workers, initializer=_init_worker,
-                  initargs=(lrows, lhash, lnorm, k, config.BLOCK_CHUNK)) as pool:
+                  initargs=(lrows, lhash, lnorm, k, config.BLOCK_CHUNK,
+                            wide, l_skel, l_addr)) as pool:
         for sl, sr, ss in pool.imap_unordered(
                 _query_one, iter_shards(paths, country, batch_rows)):
             done += 1
@@ -109,24 +122,39 @@ def _block_country_parallel(left, paths, country, k, batch_rows,
 _W = {}     # worker state, inherited through fork
 
 
-def _init_worker(lrows, lhash, lnorm, k, chunk):
-    _W.update(lrows=lrows, lhash=lhash, lnorm=lnorm, k=k, chunk=chunk)
+def _init_worker(lrows, lhash, lnorm, k, chunk, wide, l_skel, l_addr):
+    _W.update(lrows=lrows, lhash=lhash, lnorm=lnorm, k=k, chunk=chunk,
+              wide=wide, l_skel=l_skel, l_addr=l_addr)
 
 
 def _query_one(shard):
-    """Run in a worker: index one shard, query the whole left side against it."""
+    """Run in a worker: index one shard, query the whole left side against it.
+
+    When `wide > k`, the shard is queried for `wide` candidates by the cheap IDF
+    cosine and those are then rescored with real string similarity before being
+    cut to `k`. Rescoring here rather than in the parent is what keeps it
+    affordable: the shard's text is already in memory, so no lookup of
+    right-hand attributes by id is needed anywhere.
+    """
     idx = ShardIndex(shard, verbose=False)
     if idx.empty:
         return (np.empty(0, np.int32), np.empty(0, np.int64),
                 np.empty(0, np.float32))
+    wide = max(_W["wide"], _W["k"])
     sl, sr, ss = query_shard(_W["lrows"], _W["lhash"], _W["lnorm"], idx,
-                             _W["k"], _W["chunk"])
+                             wide, _W["chunk"])
+    if wide > _W["k"] and len(sl):
+        r_skel = shard["s_name"].fillna("").to_numpy()
+        r_addr = shard["n_addr"].fillna("").to_numpy()
+        ss = rescore_pairs(_W["l_skel"], _W["l_addr"], r_skel, r_addr,
+                           sl, sr, ss)
+        sl, sr, ss = topk_per_row(sl, sr, ss, _W["k"])
     ids = enc_ids(shard["entity_id"].to_numpy())
     return sl, ids[sr], ss
 
 
 def block_country(left: pd.DataFrame, paths, country, k, batch_rows,
-                  verbose=True, workers=1):
+                  verbose=True, workers=1, wide=0):
     """Top-k candidates for every left row of one country. Returns int64 ids.
 
     Each shard is independent -- index, query, discard -- so with `workers > 1`
@@ -143,9 +171,10 @@ def block_country(left: pd.DataFrame, paths, country, k, batch_rows,
 
     if workers > 1:
         return _block_country_parallel(left, paths, country, k, batch_rows,
-                                       lrows, lhash, verbose, workers)
+                                       lrows, lhash, verbose, workers, wide)
 
-    lnorm = None
+    # same per-channel norms as the parallel path, so both agree
+    lnorm = _first_shard_norm(paths, country, batch_rows, lrows, lhash, len(left))
     best_l = np.empty(0, np.int32)
     best_r = np.empty(0, np.int64)
     best_s = np.empty(0, np.float32)
@@ -157,16 +186,6 @@ def block_country(left: pd.DataFrame, paths, country, k, batch_rows,
         idx = ShardIndex(shard, verbose=False)
         if idx.empty:
             continue
-        if lnorm is None:
-            pos = np.searchsorted(idx.uniq, lhash)
-            np.clip(pos, 0, len(idx.uniq) - 1, out=pos)
-            ok = idx.uniq[pos] == lhash
-            w = np.zeros(len(lhash), dtype=np.float64)
-            w[ok] = idx.idf[pos[ok]]
-            lnorm = np.sqrt(np.bincount(lrows, weights=w,
-                                        minlength=len(left))).astype(np.float32)
-            np.maximum(lnorm, 1e-6, out=lnorm)
-            del w, pos, ok
 
         sl, sr, ss = query_shard(lrows, lhash, lnorm, idx, k, config.BLOCK_CHUNK)
         shard_ids = enc_ids(shard["entity_id"].to_numpy())
@@ -198,6 +217,9 @@ def main(argv=None):
     ap.add_argument("--out", default=None)
     ap.add_argument("--workers", type=int, default=1,
                     help="parallel shard queries; each holds one shard index")
+    ap.add_argument("--wide", type=int, default=0,
+                    help="retrieve this many per shard by IDF, rescore with "
+                         "string similarity, then cut to --top-k (0 = off)")
     a = ap.parse_args(argv)
 
     k = a.top_k or config.BLOCK_TOPK_FORWARD
@@ -211,14 +233,14 @@ def main(argv=None):
     right_paths = [config.WORK_DIR / f"{a.split}_source2.parquet",
                    config.WORK_DIR / f"{a.split}_source3.parquet"]
     print(f"[blocking] split={a.split} left={len(s1):,} k={k} "
-          f"shard={batch_rows:,} workers={a.workers}", flush=True)
+          f"shard={batch_rows:,} workers={a.workers} wide={a.wide}", flush=True)
 
     parts = []
     for country in sorted(s1["country_key"].unique()):
         L = s1[s1["country_key"] == country].reset_index(drop=True)
         print(f"  country={country!r}: {len(L):,} entities", flush=True)
         li, ri, sc = block_country(L, right_paths, country, k, batch_rows,
-                                   workers=a.workers)
+                                   workers=a.workers, wide=a.wide)
         if len(li) == 0:
             continue
         parts.append(pd.DataFrame({

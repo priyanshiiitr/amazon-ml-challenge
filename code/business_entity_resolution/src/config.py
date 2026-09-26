@@ -99,8 +99,8 @@ VALID_FRACTION = 0.2         # share of source1 entities held out for tuning
 LGB_PARAMS = dict(
     objective="binary",
     learning_rate=0.05,
-    num_leaves=127,
-    min_data_in_leaf=50,
+    num_leaves=255,
+    min_data_in_leaf=100,
     feature_fraction=0.85,
     bagging_fraction=0.85,
     bagging_freq=1,
@@ -110,8 +110,9 @@ LGB_PARAMS = dict(
     num_threads=0,
     seed=SEED,
 )
-LGB_ROUNDS = 3000
-LGB_EARLY_STOP = 100
+LGB_ROUNDS = 15000   # the 3000 cap was binding: best_iter came back as
+                     # exactly 3000, i.e. the model was still improving
+LGB_EARLY_STOP = 200
 
 # --- decision layer -----------------------------------------------------
 # grids searched by tune_decision(); widened automatically if the optimum sits
@@ -120,3 +121,7 @@ TAU_EMPTY_GRID = [round(x, 3) for x in [i / 40 for i in range(4, 33)]]   # 0.10 
 TAU_ABS_GRID = [round(x, 3) for x in [i / 40 for i in range(4, 33)]]
 ALPHA_GRID = [0.0, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
 ONE_TO_ONE_OPTIONS = [False, True]
+
+# --- sharded retrieval (memory-bounded) ---------------------------------
+SHARD_SIZE = 1_000_000       # right-hand rows indexed at once; peak RAM scales
+                             # with this, not with the size of the data

@@ -19,11 +19,12 @@ run, so this never crosses a process boundary.
 """
 from __future__ import annotations
 
-import os
 import time
 
 import numpy as np
 import pandas as pd
+from rapidfuzz import fuzz
+from rapidfuzz import process as rf_process
 
 from . import config
 
@@ -147,7 +148,23 @@ class ShardIndex:
         self.uniq = uniq
 
         self.idf = np.log(1.0 + n_right / np.maximum(df, 1)).astype(np.float32)
+
+        # Channel of each key: 0 = derived from the name, 1 = from the address.
+        # The two are scored and normalised separately (see query_shard). With a
+        # single mixed vector, a pair whose name was replaced but whose address
+        # survived gets its cosine crushed: the name keys contribute nothing to
+        # the numerator yet still inflate both norms. That is exactly the 68.6%
+        # of hard links measured as "name destroyed, address intact".
+        self.chan = np.isin(first_tag, [TAG_PA, TAG_NA, TAG_AB]).astype(np.int8)
+
         w2 = self.idf[sorted_keys] ** 2
+        ch = self.chan[sorted_keys]
+        self.norm_n = np.sqrt(np.bincount(self.postings, weights=w2 * (ch == 0),
+                                          minlength=n_right)).astype(np.float32)
+        self.norm_a = np.sqrt(np.bincount(self.postings, weights=w2 * (ch == 1),
+                                          minlength=n_right)).astype(np.float32)
+        np.maximum(self.norm_n, 1e-6, out=self.norm_n)
+        np.maximum(self.norm_a, 1e-6, out=self.norm_a)
         self.norm = np.sqrt(
             np.bincount(self.postings, weights=w2, minlength=n_right)
         ).astype(np.float32)
@@ -156,6 +173,38 @@ class ShardIndex:
         if verbose:
             print(f"    [shard] {n_right:,} rows, {len(uniq):,} keys, "
                   f"{len(self.postings):,} postings", flush=True)
+
+
+def rescore_pairs(l_skel, l_addr, r_skel, r_addr, lrow, rcol, block_score,
+                  w_min=0.35, w_block=0.05):
+    """Replace the bag-of-keys score with real string similarity.
+
+    The IDF cosine ranks poorly: against the full 10.3M right side, reachability
+    at K=inf is 0.993 but recall at K=120 is only 0.907, so ~9% of true links are
+    retrieved and then out-ranked.
+
+    The combination is max-dominant, not a weighted sum, because the corruption
+    is *disjunctive*. Measured on 138,165 true pairs, 99.78% have address
+    similarity >=70 OR skeleton-name similarity >=70, but frequently not both:
+    one field is destroyed while the other survives. A symmetric weighted sum
+    scores (addr=100, name=20) -- a real match with a replaced name -- the same
+    as (addr=60, name=60), which is usually noise. Taking the max as the primary
+    term and the min only as a bonus preserves that asymmetry.
+
+    An earlier symmetric version (0.45/0.45) scored 0.9069 against a 0.9073
+    baseline, i.e. no better than the cosine it replaced.
+    """
+    if len(lrow) == 0:
+        return np.empty(0, np.float32)
+    a_s = l_skel[lrow]; b_s = r_skel[rcol]
+    a_a = l_addr[lrow]; b_a = r_addr[rcol]
+    s_skel = rf_process.cpdist(a_s, b_s, scorer=fuzz.token_set_ratio,
+                               workers=1, dtype=np.float32)
+    s_addr = rf_process.cpdist(a_a, b_a, scorer=fuzz.token_set_ratio,
+                               workers=1, dtype=np.float32)
+    hi = np.maximum(s_skel, s_addr)
+    lo = np.minimum(s_skel, s_addr)
+    return (hi + w_min * lo + w_block * (100.0 * block_score)).astype(np.float32)
 
 
 def topk_per_row(lrow, rcol, score, k):
@@ -170,8 +219,18 @@ def topk_per_row(lrow, rcol, score, k):
     return lrow[keep], rcol[keep], score[keep]
 
 
-def query_shard(lrows, lhash, lnorm, index: ShardIndex, k: int, chunk: int):
-    """Top-k rows of the shard for each left row, by cosine over IDF weights."""
+def query_shard(lrows, lhash, lnorm, index: ShardIndex, k: int, chunk: int,
+                split_channels: bool = False, w_min: float = 0.35):
+    """Top-k rows of the shard for each left row, by cosine over IDF weights.
+
+    With `split_channels`, the name-derived and address-derived keys are scored
+    as two separate cosines, each normalised by its own channel's norm, and
+    combined max-dominant. The corruption is disjunctive -- 99.78% of true pairs
+    have address OR name similarity >=70, often not both -- so a single mixed
+    vector penalises precisely the pairs where one field was destroyed.
+
+    `lnorm` is then a 2-row array: [name norms, address norms].
+    """
     if index.empty:
         return (np.empty(0, np.int32), np.empty(0, np.int32),
                 np.empty(0, np.float32))
@@ -204,6 +263,7 @@ def query_shard(lrows, lhash, lnorm, index: ShardIndex, k: int, chunk: int):
 
         left_rep = np.repeat(ck_rows, lens)
         w_rep = np.repeat(index.idf[ck_keys], lens)
+        ch_rep = np.repeat(index.chan[ck_keys], lens)
         offs = (np.arange(total, dtype=np.int64)
                 - np.repeat(np.cumsum(np.r_[0, lens[:-1]]), lens))
         right_rep = index.postings[np.repeat(starts, lens) + offs]
@@ -212,17 +272,36 @@ def query_shard(lrows, lhash, lnorm, index: ShardIndex, k: int, chunk: int):
         comb = left_rep.astype(np.int64) * index.n_right + right_rep
         del left_rep, right_rep
         o = np.argsort(comb, kind="stable")
-        comb, w_rep = comb[o], w_rep[o]
+        comb, w_rep, ch_rep = comb[o], w_rep[o], ch_rep[o]
         del o
         bnd = np.flatnonzero(np.r_[True, comb[1:] != comb[:-1]])
-        pair_score = np.add.reduceat(w_rep, bnd).astype(np.float32)
+        if split_channels:
+            sum_n = np.add.reduceat(w_rep * (ch_rep == 0), bnd).astype(np.float32)
+            sum_a = np.add.reduceat(w_rep * (ch_rep == 1), bnd).astype(np.float32)
+        else:
+            pair_score = np.add.reduceat(w_rep, bnd).astype(np.float32)
         pc = comb[bnd]
-        del comb, w_rep, bnd
+        del comb, w_rep, ch_rep, bnd
 
         pl = (pc // index.n_right).astype(np.int32)
         pr = (pc % index.n_right).astype(np.int32)
         del pc
-        pair_score /= lnorm[pl] * index.norm[pr]
+        if split_channels:
+            cos_n = sum_n / (lnorm[0][pl] * index.norm_n[pr])
+            cos_a = sum_a / (lnorm[1][pl] * index.norm_a[pr])
+            del sum_n, sum_a
+            hi = np.maximum(cos_n, cos_a)
+            lo_ = np.minimum(cos_n, cos_a)
+            pair_score = (hi + w_min * lo_).astype(np.float32)
+            del cos_n, cos_a, hi, lo_
+        else:
+            # lnorm is (2, n_left): per-channel norms. The mixed norm is their
+            # quadrature sum, since norm^2 is just the total of idf^2 over all
+            # of a row's keys. Indexing the 2-row array directly would broadcast
+            # into an (n_pairs, n_left) array.
+            ln2 = (np.sqrt(lnorm[0][pl] ** 2 + lnorm[1][pl] ** 2)
+                   if lnorm.ndim == 2 else lnorm[pl])
+            pair_score /= ln2 * index.norm[pr]
         pl, pr, ps = topk_per_row(pl, pr, pair_score, k)
         out_l.append(pl); out_r.append(pr); out_s.append(ps)
 

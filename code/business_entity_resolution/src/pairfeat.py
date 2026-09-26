@@ -23,6 +23,8 @@ import pandas as pd
 from rapidfuzz import fuzz
 from rapidfuzz import process as rf_process
 
+from .tokidf import idf_stats
+
 _SCORERS = {
     "tsr": fuzz.token_set_ratio,
     "tso": fuzz.token_sort_ratio,
@@ -43,7 +45,7 @@ def _tokset(s):
 
 
 def build_features(pairs: pd.DataFrame, left: pd.DataFrame, right: pd.DataFrame,
-                   verbose=True) -> pd.DataFrame:
+                   verbose=True, split: str = "train") -> pd.DataFrame:
     """pairs: [source1_entity_id, cand_id, sim_block]; left/right indexed by id.
 
     `left` must be indexed by entity_id (string), `right` by the int64 encoded
@@ -65,6 +67,17 @@ def build_features(pairs: pd.DataFrame, left: pd.DataFrame, right: pd.DataFrame,
 
     f = pd.DataFrame(index=pairs.index)
     f["sim_block"] = pairs["sim_block"].to_numpy(np.float32)
+    # competition features, if the candidate table carries them (see
+    # competition.py). They encode what *else* is claiming this candidate,
+    # which the one-to-one structure makes highly informative.
+    for c in ("cand_n_claims", "cand_max_sim", "sim_rel_cand", "cand_is_best",
+              "cand_rank", "cand_name_sim", "cand_name_max", "cand_name_rel",
+              "cand_name_is_best", "cand_name_rank",
+              # retrieval provenance: rev_rank==0 means this entity is the
+              # record's single best owner among all 2.2M Source 1 entities
+              "rev_score", "rev_rank", "fwd_hit", "rev_hit", "both_hit"):
+        if c in pairs.columns:
+            f[c] = pairs[c].to_numpy(np.float32)
 
     if verbose:
         print("    name similarities...", flush=True)
@@ -76,12 +89,29 @@ def build_features(pairs: pd.DataFrame, left: pd.DataFrame, right: pd.DataFrame,
         f[f"skel_{tag}"] = _cpdist(ls, rs, _SCORERS[tag])
     if verbose:
         print("    address similarities...", flush=True)
+    # An empty address is MISSING data, not disagreement. token_set_ratio("x","")
+    # returns 0, and because the address features carry the highest gain in the
+    # model, a blank address was being read as "the addresses strongly differ".
+    # Error analysis found true pairs with an exactly matching name and a blank
+    # right-hand address scoring ~0.1. LightGBM handles NaN natively as missing,
+    # so the trees can route these cases instead of penalising them.
+    addr_missing = (la == "") | (ra == "")
     for tag in ("tsr", "tso", "rat"):
-        f[f"addr_{tag}"] = _cpdist(la, ra, _SCORERS[tag])
+        v = _cpdist(la, ra, _SCORERS[tag])
+        v[addr_missing] = np.nan
+        f[f"addr_{tag}"] = v
 
     # ---- discrete agreement -------------------------------------------
     if verbose:
         print("    discrete features...", flush=True)
+    # name rarity: an exact match on a generic name ("blue trading",
+    # "new delhi india") is weak evidence, but the pair features treat every
+    # matching token alike. The model's confident false merges were dominated by
+    # exactly such names, so expose how rare the name actually is.
+    st = idf_stats(ln, split)
+    f["name_idf_min"] = st[0]
+    f["name_idf_mean"] = st[1]
+    f["name_idf_max"] = st[2]
     f["postal_eq"] = ((lp == rp) & (lp != "")).astype(np.int8)
     f["postal_both"] = ((lp != "") & (rp != "")).astype(np.int8)
     f["acr_eq"] = ((lc == rc) & (lc != "")).astype(np.int8)
@@ -102,20 +132,34 @@ def build_features(pairs: pd.DataFrame, left: pd.DataFrame, right: pd.DataFrame,
     f["name_tok_inter"] = ni
     f["name_tok_jacc"] = ni / nu
     ai, au = overlap(la, ra)
+    ai[addr_missing] = np.nan
     f["addr_tok_inter"] = ai
-    f["addr_tok_jacc"] = ai / au
+    f["addr_tok_jacc"] = np.where(addr_missing, np.nan, ai / au)
 
     def numset(s):
-        return {t for t in s.split() if t[:1].isdigit()} if s else set()
+        # ANY token containing a digit, not just tokens starting with one.
+        # Unit designators like "d1", "c2", "e50" are exactly what distinguishes
+        # neighbouring businesses, and error analysis found confident false
+        # merges that differed only there: "room no 6 404 d1" vs "404 d6"
+        # scored 0.999 because neither token was being extracted.
+        return {t for t in s.split() if any(c.isdigit() for c in t)} if s else set()
 
     num_i = np.empty(len(la), np.float32)
     num_u = np.empty(len(la), np.float32)
+    num_c = np.empty(len(la), np.float32)
     for i in range(len(la)):
         sa, sb = numset(la[i]), numset(ra[i])
         num_i[i] = len(sa & sb)
         num_u[i] = len(sa | sb) or 1
+        # tokens present on one side only: positive evidence AGAINST a match,
+        # which an intersection-only view cannot express
+        num_c[i] = len(sa ^ sb)
+    num_i[addr_missing] = np.nan
+    num_c[addr_missing] = np.nan
     f["addr_num_inter"] = num_i
-    f["addr_num_jacc"] = num_i / num_u
+    f["addr_num_jacc"] = np.where(addr_missing, np.nan, num_i / num_u)
+    f["addr_num_conflict"] = num_c
+    f["addr_num_conflict_rate"] = np.where(addr_missing, np.nan, num_c / num_u)
 
     # ---- length / shape ------------------------------------------------
     f["len_name_l"] = np.fromiter((len(x) for x in ln), np.float32, len(ln))
@@ -144,8 +188,86 @@ def build_features(pairs: pd.DataFrame, left: pd.DataFrame, right: pd.DataFrame,
     for col in ("sim_block", "name_tsr", "skel_tsr", "addr_tsr"):
         add_rel(col)
 
+    # ---- transitivity: does this candidate agree with the entity's best? ----
+    # Every true match of an entity is a corrupted copy of the *same* business,
+    # so the true matches should resemble each other, while a distractor
+    # typically resembles only the Source 1 record on one field. Comparing each
+    # candidate against its entity's strongest candidate gives the model a view
+    # of that agreement, which a pairwise-only feature set cannot express.
+    if verbose:
+        print("    transitivity features...", flush=True)
+    anchor = np.zeros(n_ent, np.int64)
+    best_v = np.full(n_ent, -np.inf, np.float32)
+    sb = f["sim_block"].to_numpy(np.float32)
+    np.maximum.at(best_v, codes, sb)
+    is_best = sb >= best_v[codes] - 1e-9
+    anchor[codes[is_best]] = np.flatnonzero(is_best)
+    apos = anchor[codes]
+    f["is_anchor"] = is_best.astype(np.int8)
+    f["skel_vs_anchor"] = _cpdist(rs, rs[apos], _SCORERS["tsr"])
+    f["addr_vs_anchor"] = _cpdist(ra, ra[apos], _SCORERS["tsr"])
+    # agreement with the Source 1 record, relative to how well the anchor agrees
+    f["anchor_gap_skel"] = f["skel_tsr"].to_numpy() - f["skel_tsr"].to_numpy()[apos]
+    f["anchor_gap_addr"] = f["addr_tsr"].to_numpy() - f["addr_tsr"].to_numpy()[apos]
+
+    # ---- cluster support among an entity's own candidates ------------------
+    # An entity's true matches are several corrupted copies of one business, so
+    # they resemble each other far more than anything else: over 127,802
+    # co-matched pairs max(skeleton, address) similarity averages 97.2 and
+    # clears 80 for 96.5% of them, versus 46.7 and 0.4% for random right-right
+    # pairs. A candidate with several near-identical siblings in the same
+    # entity's list is therefore very likely real.
+    #
+    # Applying this as a hard rule (predict the whole best cluster) measured
+    # 0.884 -- it lifted link recall 0.807 -> 0.859 but cost precision
+    # 0.978 -> 0.927, which F_0.5 punishes twice as hard. As features, the model
+    # can decide when the evidence is worth acting on.
+    if verbose:
+        print("    cluster-support features...", flush=True)
+    TOPM = 16
+    rank_all = np.empty(len(codes), np.int64)
+    o3 = np.lexsort((-f["sim_block"].to_numpy(), codes))
+    st3 = np.flatnonzero(np.r_[True, codes[o3][1:] != codes[o3][:-1]])
+    gs3 = np.repeat(st3, np.diff(np.r_[st3, len(o3)]))
+    rank_all[o3] = np.arange(len(o3)) - gs3
+    inm = rank_all < TOPM
+
+    idx_in = np.flatnonzero(inm)
+    ci = codes[idx_in]
+    order_in = np.argsort(ci, kind="stable")
+    idx_in = idx_in[order_in]
+    ci = ci[order_in]
+    gstart = np.flatnonzero(np.r_[True, ci[1:] != ci[:-1]])
+    gend = np.r_[gstart[1:], len(ci)]
+
+    ai_l, bi_l = [], []
+    for s_, e_ in zip(gstart.tolist(), gend.tolist()):
+        m = e_ - s_
+        if m < 2:
+            continue
+        u, v = np.triu_indices(m, 1)
+        ai_l.append(idx_in[s_ + u])
+        bi_l.append(idx_in[s_ + v])
+    deg = np.zeros(len(codes), np.float32)
+    mass = np.zeros(len(codes), np.float32)
+    if ai_l:
+        ai = np.concatenate(ai_l); bi = np.concatenate(bi_l)
+        sim_s = _cpdist(rs[ai], rs[bi], _SCORERS["tsr"])
+        sim_a = _cpdist(ra[ai], ra[bi], _SCORERS["tsr"])
+        mx = np.maximum(sim_s, sim_a)
+        hit = mx >= 85.0
+        sb_all = f["sim_block"].to_numpy(np.float32)
+        np.add.at(deg, ai[hit], 1.0)
+        np.add.at(deg, bi[hit], 1.0)
+        np.add.at(mass, ai[hit], sb_all[bi[hit]])
+        np.add.at(mass, bi[hit], sb_all[ai[hit]])
+        del ai, bi, sim_s, sim_a, mx, hit
+    f["clus_deg"] = deg
+    f["clus_mass"] = mass
+
     cnt = np.bincount(codes, minlength=n_ent).astype(np.float32)
     f["n_cands"] = cnt[codes]
+    f["clus_deg_rel"] = deg / np.maximum(np.minimum(cnt[codes], TOPM) - 1, 1)
     # rank of this candidate within its entity by the combined blocking score
     order = np.lexsort((-f["skel_tsr"].to_numpy(), codes))
     rank = np.empty(len(codes), np.float32)
