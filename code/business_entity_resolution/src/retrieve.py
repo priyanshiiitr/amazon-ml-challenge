@@ -116,8 +116,12 @@ def extract_keys(df: pd.DataFrame):
 class ShardIndex:
     """Postings over one right-hand shard, keyed by sorted unique key hash."""
 
-    def __init__(self, right: pd.DataFrame, verbose=False):
+    def __init__(self, right: pd.DataFrame, verbose=False, keep_tags=None):
+        """`keep_tags` restricts the index to one retrieval view's channels."""
         rows, hashes, tags = extract_keys(right)
+        if keep_tags is not None:
+            m = np.isin(tags, list(keep_tags))
+            rows, hashes, tags = rows[m], hashes[m], tags[m]
         n_right = len(right)
         if len(rows) == 0:
             self.empty = True
