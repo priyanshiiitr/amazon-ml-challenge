@@ -1,0 +1,11 @@
+# Binary artefacts must never go through line-ending conversion, which would
+# corrupt them on checkout.
+*.pdf binary
+*.parquet binary
+*.pkl binary
+*.zip binary
+
+# Keep source and data files LF in the repository regardless of platform.
+*.py text eol=lf
+*.md text eol=lf
+*.tsv text eol=lf
